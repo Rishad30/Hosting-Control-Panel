@@ -372,11 +372,15 @@ class PanelHandler(BaseHTTPRequestHandler):
                         is_dir = entry.is_dir()
                         size = 0
                         count = 0
+                        modified = ""
                         try:
+                            st = entry.stat()
+                            # আসল মডিফিকেশন টাইমস্ট্যাম্প আনা হচ্ছে
+                            modified = datetime.fromtimestamp(st.st_mtime).strftime("%m/%d/%y")
                             if is_dir:
                                 count = len(os.listdir(entry.path))
                             else:
-                                size = entry.stat().st_size
+                                size = st.st_size
                         except Exception:
                             pass
                         items.append({
@@ -384,6 +388,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                             "type": "folder" if is_dir else "file",
                             "size": size,
                             "count": count,
+                            "modified": modified,
                         })
                 return self.send_json(200, {"items": items})
 
@@ -415,7 +420,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "type": "Folder" if is_dir else "File",
                     "size": total_size,
                     "permissions": oct(stat.S_IMODE(st.st_mode))[2:].zfill(3),
-                    "modified": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "modified": datetime.fromtimestamp(st.st_mtime).strftime("%m/%d/%y"),
                 })
 
             if pathname == "/api/download":
