@@ -1,12 +1,16 @@
 import os
+import re
+import sys
 import json
 import time
 import queue
 import base64
 import shutil
 import signal
+import hashlib
 import threading
 import subprocess
+import importlib.metadata
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -14,6 +18,7 @@ PORT = int(os.environ.get("PORT", 3000))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.join(BASE_DIR, "workspace")
 START_FILE = os.path.join(BASE_DIR, ".startcmd")
+REQ_HASH_FILE = os.path.join(BASE_DIR, ".req_hash")
 
 os.makedirs(WORKSPACE, exist_ok=True)
 
@@ -24,6 +29,8 @@ else:
     start_cmd = "python3 main.py"
 
 server_proc = None
+is_starting = False
+stop_requested = False
 proc_lock = threading.Lock()
 sse_clients = set()
 sse_lock = threading.Lock()
@@ -47,9 +54,7 @@ def safe_join(rel=""):
     return WORKSPACE
 
 
-def stream_proc_logs(proc):
-    global server_proc
-
+def pipe_and_wait(proc):
     def reader(pipe, msg_type):
         try:
             for line in iter(pipe.readline, ""):
@@ -64,61 +69,165 @@ def stream_proc_logs(proc):
     code = proc.wait()
     t1.join(timeout=1)
     t2.join(timeout=1)
+    return code
 
-    with proc_lock:
-        if server_proc is proc:
-            server_proc = None
-    broadcast("warn", f"Server stopped (exit code: {code})")
+
+def needs_pip_install(req_path):
+    if not os.path.isfile(req_path):
+        return False
+    with open(req_path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        return False
+
+    current_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    saved_hash = ""
+    if os.path.isfile(REQ_HASH_FILE):
+        with open(REQ_HASH_FILE, "r", encoding="utf-8") as f:
+            saved_hash = f.read().strip()
+
+    if current_hash != saved_hash:
+        return True
+
+    for ln in lines:
+        if ln.startswith("-") or "://" in ln or "@" in ln:
+            continue
+        pkg = re.split(r"[<>=!~;\[\s#]", ln, 1)[0].strip()
+        if not pkg:
+            continue
+        try:
+            importlib.metadata.distribution(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            return True
+
+    return False
+
+
+def save_req_hash(req_path):
+    with open(req_path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    current_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    with open(REQ_HASH_FILE, "w", encoding="utf-8") as f:
+        f.write(current_hash)
+
+
+def run_server_sequence():
+    global server_proc, is_starting
+    try:
+        req_path = os.path.join(WORKSPACE, "requirements.txt")
+
+        if needs_pip_install(req_path):
+            broadcast("sys", "Installing requirements.txt...")
+            pip_proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "-r", req_path],
+                cwd=WORKSPACE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                errors="replace",
+                start_new_session=True,
+            )
+            with proc_lock:
+                server_proc = pip_proc
+
+            code = pipe_and_wait(pip_proc)
+
+            with proc_lock:
+                if server_proc is pip_proc:
+                    server_proc = None
+
+            if stop_requested:
+                broadcast("warn", "Start cancelled.")
+                return
+
+            if code != 0:
+                broadcast("err", f"requirements.txt install failed (exit code: {code})")
+                return
+
+            save_req_hash(req_path)
+            broadcast("ok", "requirements.txt installed.")
+
+        with proc_lock:
+            if stop_requested:
+                return
+            broadcast("sys", f"Starting: {start_cmd}")
+            proc = subprocess.Popen(
+                ["bash", "-c", start_cmd],
+                cwd=WORKSPACE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                errors="replace",
+                start_new_session=True,
+            )
+            server_proc = proc
+            is_starting = False
+            broadcast("ok", f"Server started (PID: {proc.pid})")
+
+        code = pipe_and_wait(proc)
+
+        with proc_lock:
+            if server_proc is proc:
+                server_proc = None
+        broadcast("warn", f"Server stopped (exit code: {code})")
+    except Exception as e:
+        broadcast("err", f"Start error: {e}")
+    finally:
+        with proc_lock:
+            is_starting = False
 
 
 def start_server_proc():
-    global server_proc
+    global stop_requested, is_starting
     with proc_lock:
-        if server_proc is not None and server_proc.poll() is None:
+        if is_starting or (server_proc is not None and server_proc.poll() is None):
             broadcast("warn", "Server is already running.")
             return
-        broadcast("sys", f"Starting: {start_cmd}")
-        server_proc = subprocess.Popen(
-            ["bash", "-c", start_cmd],
-            cwd=WORKSPACE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            errors="replace",
-            start_new_session=True,
-        )
-        broadcast("ok", f"Server started (PID: {server_proc.pid})")
-        threading.Thread(target=stream_proc_logs, args=(server_proc,), daemon=True).start()
+        stop_requested = False
+        is_starting = True
+    threading.Thread(target=run_server_sequence, daemon=True).start()
 
 
 def stop_server_proc():
-    global server_proc
+    global server_proc, stop_requested
     with proc_lock:
+        stop_requested = True
         proc = server_proc
-    if proc is None or proc.poll() is not None:
+        starting = is_starting
+
+    if not starting and (proc is None or proc.poll() is not None):
         broadcast("warn", "Server is not running.")
         return
 
     broadcast("warn", "Stopping server...")
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except Exception:
+    if proc is not None and proc.poll() is None:
         try:
-            proc.terminate()
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except Exception:
-            pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+        for _ in range(20):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
 
     for _ in range(20):
-        if proc.poll() is not None:
-            break
+        with proc_lock:
+            if not is_starting and (server_proc is None or server_proc.poll() is not None):
+                break
         time.sleep(0.1)
-
-    if proc.poll() is None:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
 
     with proc_lock:
         if server_proc is proc:
