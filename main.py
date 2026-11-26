@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import stat
 import json
 import time
 import queue
@@ -8,9 +9,13 @@ import base64
 import shutil
 import signal
 import hashlib
+import zipfile
+import tarfile
+import tempfile
 import threading
 import subprocess
 import importlib.metadata
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -52,6 +57,23 @@ def safe_join(rel=""):
     if full == WORKSPACE or full.startswith(WORKSPACE + os.sep):
         return full
     return WORKSPACE
+
+
+def unique_dest_path(dest_dir, name):
+    candidate = os.path.join(dest_dir, name)
+    if not os.path.exists(candidate):
+        return candidate
+    base, ext = os.path.splitext(name)
+    if os.path.isdir(candidate):
+        base, ext = name, ""
+    i = 1
+    while True:
+        suffix = " (copy)" if i == 1 else f" (copy {i})"
+        new_name = f"{base}{suffix}{ext}"
+        candidate = os.path.join(dest_dir, new_name)
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
 
 
 def pipe_and_wait(proc):
@@ -234,6 +256,31 @@ def stop_server_proc():
             server_proc = None
 
 
+def create_zip_archive(src_paths, zip_path):
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for src in src_paths:
+            if not os.path.exists(src):
+                continue
+            base = os.path.dirname(src)
+            if os.path.isfile(src):
+                if src != zip_path:
+                    zf.write(src, os.path.relpath(src, base))
+            elif os.path.isdir(src):
+                added = False
+                for root, dirs, files in os.walk(src):
+                    for fn in files:
+                        fp = os.path.join(root, fn)
+                        if fp == zip_path:
+                            continue
+                        zf.write(fp, os.path.relpath(fp, base))
+                        added = True
+                    if not dirs and not files:
+                        zf.writestr(os.path.relpath(root, base) + "/", "")
+                        added = True
+                if not added:
+                    zf.writestr(os.path.relpath(src, base) + "/", "")
+
+
 class PanelHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -242,6 +289,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -345,6 +393,70 @@ class PanelHandler(BaseHTTPRequestHandler):
                     content = f.read()
                 return self.send_json(200, {"content": content})
 
+            if pathname == "/api/info":
+                rel = qs.get("path", [""])[0]
+                target = safe_join(rel)
+                if not os.path.exists(target):
+                    return self.send_json(404, {"error": "Item not found"})
+                st = os.stat(target)
+                is_dir = os.path.isdir(target)
+                total_size = st.st_size
+                if is_dir:
+                    total_size = 0
+                    for root, _, files in os.walk(target):
+                        for fn in files:
+                            try:
+                                total_size += os.path.getsize(os.path.join(root, fn))
+                            except Exception:
+                                pass
+                return self.send_json(200, {
+                    "name": os.path.basename(target),
+                    "path": "/" + os.path.relpath(target, WORKSPACE).replace("\\", "/"),
+                    "type": "Folder" if is_dir else "File",
+                    "size": total_size,
+                    "permissions": oct(stat.S_IMODE(st.st_mode))[2:].zfill(3),
+                    "modified": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                })
+
+            if pathname == "/api/download":
+                rel = qs.get("path", [""])[0]
+                target = safe_join(rel)
+                if not os.path.exists(target):
+                    return self.send_json(404, {"error": "File not found"})
+
+                if os.path.isfile(target):
+                    filename = os.path.basename(target)
+                    size = os.path.getsize(target)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.send_header("Content-Length", str(size))
+                    self.send_cors_headers()
+                    self.end_headers()
+                    with open(target, "rb") as f:
+                        shutil.copyfileobj(f, self.wfile)
+                    return
+
+                # Folder download as zip
+                tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+                tmp.close()
+                try:
+                    create_zip_archive([target], tmp.name)
+                    filename = os.path.basename(target) + ".zip"
+                    size = os.path.getsize(tmp.name)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.send_header("Content-Length", str(size))
+                    self.send_cors_headers()
+                    self.end_headers()
+                    with open(tmp.name, "rb") as f:
+                        shutil.copyfileobj(f, self.wfile)
+                finally:
+                    if os.path.exists(tmp.name):
+                        os.remove(tmp.name)
+                return
+
             self.send_json(404, {"error": "Not found"})
         except Exception as e:
             self.send_json(500, {"error": str(e)})
@@ -375,6 +487,91 @@ class PanelHandler(BaseHTTPRequestHandler):
 
             if pathname == "/api/rename":
                 os.rename(safe_join(data.get("oldPath", "")), safe_join(data.get("newPath", "")))
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/copy":
+                sources = data.get("sources", [])
+                dest_dir = safe_join(data.get("destDir", ""))
+                if not os.path.isdir(dest_dir):
+                    return self.send_json(400, {"error": "Destination is not a folder"})
+                for rel in sources:
+                    src = safe_join(rel)
+                    if not os.path.exists(src) or src == WORKSPACE:
+                        continue
+                    if os.path.isdir(src) and (dest_dir == src or dest_dir.startswith(src + os.sep)):
+                        return self.send_json(400, {"error": "Cannot copy folder into itself"})
+                    dst = unique_dest_path(dest_dir, os.path.basename(src))
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/move":
+                sources = data.get("sources", [])
+                dest_dir = safe_join(data.get("destDir", ""))
+                if not os.path.isdir(dest_dir):
+                    return self.send_json(400, {"error": "Destination is not a folder"})
+                for rel in sources:
+                    src = safe_join(rel)
+                    if not os.path.exists(src) or src == WORKSPACE:
+                        continue
+                    if os.path.isdir(src) and (dest_dir == src or dest_dir.startswith(src + os.sep)):
+                        return self.send_json(400, {"error": "Cannot move folder into itself"})
+                    if os.path.dirname(src) == dest_dir:
+                        continue
+                    dst = unique_dest_path(dest_dir, os.path.basename(src))
+                    shutil.move(src, dst)
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/zip":
+                sources = data.get("sources", [])
+                dest_dir = safe_join(data.get("destDir", ""))
+                zip_name = os.path.basename((data.get("zipName") or "archive.zip").strip())
+                if not zip_name.lower().endswith(".zip"):
+                    zip_name += ".zip"
+                zip_path = unique_dest_path(dest_dir, zip_name)
+                src_paths = [safe_join(r) for r in sources]
+                create_zip_archive(src_paths, zip_path)
+                return self.send_json(200, {"ok": True, "name": os.path.basename(zip_path)})
+
+            if pathname == "/api/unzip":
+                archive_path = safe_join(data.get("path", ""))
+                dest_dir = safe_join(data.get("destDir", ""))
+                if not os.path.isfile(archive_path):
+                    return self.send_json(404, {"error": "Archive not found"})
+                lower = archive_path.lower()
+                if lower.endswith(".zip"):
+                    with zipfile.ZipFile(archive_path, "r") as zf:
+                        for member in zf.infolist():
+                            mp = os.path.abspath(os.path.join(dest_dir, member.filename))
+                            if not (mp == dest_dir or mp.startswith(dest_dir + os.sep)):
+                                return self.send_json(400, {"error": "Unsafe path in zip"})
+                        zf.extractall(dest_dir)
+                elif lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+                    with tarfile.open(archive_path, "r:*") as tf:
+                        tf.extractall(dest_dir, filter="data")
+                else:
+                    return self.send_json(400, {"error": "Unsupported archive format"})
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/chmod":
+                target = safe_join(data.get("path", ""))
+                mode_str = str(data.get("mode", "")).strip()
+                if not re.fullmatch(r"[0-7]{3,4}", mode_str):
+                    return self.send_json(400, {"error": "Invalid mode (use e.g. 755 or 644)"})
+                os.chmod(target, int(mode_str, 8))
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/delete-batch":
+                paths = data.get("paths", [])
+                for rel in paths:
+                    target = safe_join(rel)
+                    if target != WORKSPACE:
+                        if os.path.isdir(target):
+                            shutil.rmtree(target)
+                        elif os.path.exists(target):
+                            os.remove(target)
                 return self.send_json(200, {"ok": True})
 
             if pathname == "/api/server":
