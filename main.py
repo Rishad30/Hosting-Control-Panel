@@ -48,6 +48,8 @@ def safe_join(rel=""):
 
 
 def stream_proc_logs(proc):
+    global server_proc
+
     def reader(pipe, msg_type):
         try:
             for line in iter(pipe.readline, ""):
@@ -64,7 +66,6 @@ def stream_proc_logs(proc):
     t2.join(timeout=1)
 
     with proc_lock:
-        global server_proc
         if server_proc is proc:
             server_proc = None
     broadcast("warn", f"Server stopped (exit code: {code})")
@@ -240,6 +241,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": str(e)})
 
     def do_POST(self):
+        global start_cmd
         pathname = urlparse(self.path).path
 
         try:
@@ -281,7 +283,6 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True})
 
             if pathname == "/api/exec":
-                global start_cmd
                 cmd = (data.get("cmd") or "").strip()
                 rel_path = data.get("relPath", "")
 
