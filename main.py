@@ -1,14 +1,18 @@
 import os
 import re
+import pty
 import sys
 import stat
 import json
 import time
+import fcntl
 import queue
 import base64
 import shutil
 import signal
+import struct
 import hashlib
+import termios
 import zipfile
 import tarfile
 import tempfile
@@ -24,6 +28,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.join(BASE_DIR, "workspace")
 START_FILE = os.path.join(BASE_DIR, ".startcmd")
 REQ_HASH_FILE = os.path.join(BASE_DIR, ".req_hash")
+RC_FILE = os.path.join(BASE_DIR, ".panel_bashrc")
+HIST_FILE = os.path.join(BASE_DIR, ".panel_bash_history")
 
 os.makedirs(WORKSPACE, exist_ok=True)
 
@@ -39,6 +45,291 @@ stop_requested = False
 proc_lock = threading.Lock()
 sse_clients = set()
 sse_lock = threading.Lock()
+
+
+def write_panel_bashrc():
+    rc_content = f"""[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc 2>/dev/null || true
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
+
+export TERM="xterm-256color"
+export COLORTERM="truecolor"
+export LANG="C.UTF-8"
+export LC_ALL="C.UTF-8"
+export PATH="$HOME/.local/bin:{WORKSPACE}/.local/bin:./node_modules/.bin:$PATH"
+export HISTFILE="{HIST_FILE}"
+export HISTSIZE=5000
+export HISTFILESIZE=10000
+shopt -s histappend 2>/dev/null || true
+shopt -s checkwinsize 2>/dev/null || true
+
+alias ls='ls --color=auto'
+alias ll='ls -alF --color=auto'
+alias la='ls -A --color=auto'
+alias grep='grep --color=auto'
+
+PS1='\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\[\\e[1;32m\\]\\$\\[\\e[0m\\] '
+
+_panel_api() {{
+  "{sys.executable}" -c '
+import sys, urllib.request
+req = urllib.request.Request(
+    "http://127.0.0.1:{PORT}" + sys.argv[1],
+    data=sys.argv[2].encode("utf-8"),
+    headers={{"Content-Type": "application/json"}},
+    method="POST"
+)
+with urllib.request.urlopen(req, timeout=10) as r:
+    pass
+' "$1" "$2" >/dev/null 2>&1
+}}
+
+start() {{ _panel_api "/api/server" '{{"action":"start"}}'; }}
+stop() {{ _panel_api "/api/server" '{{"action":"stop"}}'; }}
+restart() {{ _panel_api "/api/server" '{{"action":"restart"}}'; }}
+status() {{ _panel_api "/api/server" '{{"action":"status"}}'; }}
+setstart() {{
+  if [ -z "$*" ]; then
+    echo "Usage: setstart <command>"
+    return 1
+  fi
+  "{sys.executable}" -c '
+import sys, json, urllib.request
+req = urllib.request.Request(
+    "http://127.0.0.1:{PORT}/api/setstart",
+    data=json.dumps({{"cmd": sys.argv[1]}}).encode("utf-8"),
+    headers={{"Content-Type": "application/json"}},
+    method="POST"
+)
+with urllib.request.urlopen(req, timeout=5) as r:
+    res = json.loads(r.read().decode("utf-8"))
+    print("Startup command updated:", res.get("cmd", ""))
+' "$*"
+}}
+"""
+    with open(RC_FILE, "w", encoding="utf-8") as f:
+        f.write(rc_content)
+
+
+class PtySession:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.master_fd = None
+        self.proc = None
+        self.cols = 80
+        self.rows = 24
+        self.history = bytearray()
+        self.max_history = 65536
+        self.listeners = set()
+        self.listeners_lock = threading.Lock()
+        self.reader_started = False
+
+    def ensure_started(self, cols=None, rows=None):
+        with self.lock:
+            if cols and rows:
+                self.cols = max(10, min(500, int(cols)))
+                self.rows = max(4, min(200, int(rows)))
+            if self.proc is not None and self.proc.poll() is None and self.master_fd is not None:
+                self._apply_winsize_locked()
+                return
+            self._spawn_locked()
+
+    def _spawn_locked(self):
+        write_panel_bashrc()
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(
+            master_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", self.rows, self.cols, 0, 0),
+        )
+
+        env = os.environ.copy()
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+        env["LANG"] = "C.UTF-8"
+        env["LC_ALL"] = "C.UTF-8"
+        env["PATH"] = f"{os.path.expanduser('~')}/.local/bin:{WORKSPACE}/.local/bin:{env.get('PATH', '')}"
+
+        bash_path = shutil.which("bash")
+        if bash_path:
+            cmd = [bash_path, "--rcfile", RC_FILE, "-i"]
+        else:
+            cmd = [shutil.which("sh") or "/bin/sh", "-i"]
+
+        def setup_slave():
+            os.setsid()
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=WORKSPACE,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            preexec_fn=setup_slave,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+
+        self.master_fd = master_fd
+        self.proc = proc
+        if not self.reader_started:
+            self.reader_started = True
+            threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _apply_winsize_locked(self):
+        if self.master_fd is None:
+            return
+        try:
+            fcntl.ioctl(
+                self.master_fd,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", self.rows, self.cols, 0, 0),
+            )
+            if self.proc and self.proc.poll() is None:
+                pgid = os.tcgetpgrp(self.master_fd)
+                os.killpg(pgid, signal.SIGWINCH)
+        except Exception:
+            pass
+
+    def resize(self, cols, rows):
+        with self.lock:
+            self.cols = max(10, min(500, int(cols)))
+            self.rows = max(4, min(200, int(rows)))
+            self._apply_winsize_locked()
+
+    def write(self, data_bytes):
+        self.ensure_started()
+        with self.lock:
+            fd = self.master_fd
+        if fd is None:
+            return
+        try:
+            view = memoryview(data_bytes)
+            written = 0
+            while written < len(data_bytes):
+                n = os.write(fd, view[written:])
+                if n <= 0:
+                    break
+                written += n
+        except Exception:
+            pass
+
+    def add_listener(self):
+        q = queue.Queue(maxsize=512)
+        with self.lock:
+            hist = bytes(self.history)
+        with self.listeners_lock:
+            self.listeners.add(q)
+        return q, hist
+
+    def remove_listener(self, q):
+        with self.listeners_lock:
+            self.listeners.discard(q)
+
+    def _push_output(self, chunk):
+        with self.lock:
+            self.history.extend(chunk)
+            if len(self.history) > self.max_history:
+                del self.history[: len(self.history) - self.max_history]
+        with self.listeners_lock:
+            for q in list(self.listeners):
+                try:
+                    q.put_nowait(chunk)
+                except queue.Full:
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(chunk)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+    def _read_loop(self):
+        while True:
+            with self.lock:
+                fd = self.master_fd
+                proc = self.proc
+            if fd is None:
+                time.sleep(0.05)
+                continue
+            try:
+                data = os.read(fd, 4096)
+                if data:
+                    self._push_output(data)
+                    continue
+            except OSError:
+                pass
+
+            # Shell exited or fd closed; clean up and respawn
+            with self.lock:
+                if self.master_fd == fd:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                    self.master_fd = None
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
+                self._push_output(b"\r\n\x1b[33m[Shell exited, restarting...]\x1b[0m\r\n")
+                self._spawn_locked()
+
+
+pty_session = PtySession()
+
+
+def ws_send(sock, send_lock, opcode, data=b""):
+    length = len(data)
+    header = bytearray([0x80 | opcode])
+    if length < 126:
+        header.append(length)
+    elif length < 65536:
+        header.append(126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", length))
+    with send_lock:
+        sock.sendall(bytes(header) + data)
+
+
+def ws_recv_frame(rfile):
+    hdr = rfile.read(2)
+    if not hdr or len(hdr) < 2:
+        return None, None, True
+    b1, b2 = hdr[0], hdr[1]
+    fin = (b1 & 0x80) != 0
+    opcode = b1 & 0x0F
+    masked = (b2 & 0x80) != 0
+    length = b2 & 0x7F
+    if length == 126:
+        ext = rfile.read(2)
+        if len(ext) < 2:
+            return None, None, True
+        length = struct.unpack("!H", ext)[0]
+    elif length == 127:
+        ext = rfile.read(8)
+        if len(ext) < 8:
+            return None, None, True
+        length = struct.unpack("!Q", ext)[0]
+    mask = b""
+    if masked:
+        mask = rfile.read(4)
+        if len(mask) < 4:
+            return None, None, True
+    payload = bytearray()
+    while len(payload) < length:
+        chunk = rfile.read(length - len(payload))
+        if not chunk:
+            return None, None, True
+        payload.extend(chunk)
+    if masked:
+        for i in range(length):
+            payload[i] ^= mask[i & 3]
+    return opcode, bytes(payload), fin
 
 
 def broadcast(msg_type, text):
@@ -310,12 +601,141 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def handle_pty_ws(self, qs):
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if upgrade != "websocket" or not key:
+            return self.send_json(400, {"error": "Expected WebSocket upgrade"})
+
+        accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+
+        cols = int(qs.get("cols", ["80"])[0] or 80)
+        rows = int(qs.get("rows", ["24"])[0] or 24)
+        pty_session.ensure_started(cols, rows)
+
+        sock = self.connection
+        sock.settimeout(None)
+        send_lock = threading.Lock()
+        stop_ev = threading.Event()
+        q, hist = pty_session.add_listener()
+
+        def writer_loop():
+            try:
+                if hist:
+                    ws_send(sock, send_lock, 0x2, hist)
+                while not stop_ev.is_set():
+                    try:
+                        chunk = q.get(timeout=20)
+                        ws_send(sock, send_lock, 0x2, chunk)
+                    except queue.Empty:
+                        ws_send(sock, send_lock, 0x9, b"ping")
+            except Exception:
+                stop_ev.set()
+
+        wt = threading.Thread(target=writer_loop, daemon=True)
+        wt.start()
+
+        frag_buf = bytearray()
+        frag_opcode = None
+        try:
+            while not stop_ev.is_set():
+                opcode, payload, fin = ws_recv_frame(self.rfile)
+                if opcode is None:
+                    break
+                if opcode == 0x8:  # Close
+                    try:
+                        ws_send(sock, send_lock, 0x8, b"")
+                    except Exception:
+                        pass
+                    break
+                if opcode == 0x9:  # Ping
+                    ws_send(sock, send_lock, 0xA, payload)
+                    continue
+                if opcode == 0xA:  # Pong
+                    continue
+
+                if opcode in (0x1, 0x2):
+                    if not fin:
+                        frag_opcode = opcode
+                        frag_buf = bytearray(payload)
+                        continue
+                    msg_bytes = payload
+                elif opcode == 0x0:
+                    frag_buf.extend(payload)
+                    if not fin:
+                        continue
+                    msg_bytes = bytes(frag_buf)
+                    frag_buf.clear()
+                    frag_opcode = None
+                else:
+                    continue
+
+                try:
+                    msg = json.loads(msg_bytes.decode("utf-8"))
+                    t = msg.get("t")
+                    if t == "i":
+                        pty_session.write(msg.get("d", "").encode("utf-8"))
+                    elif t == "r":
+                        pty_session.resize(msg.get("c", 80), msg.get("r", 24))
+                except Exception:
+                    pty_session.write(msg_bytes)
+        except Exception:
+            pass
+        finally:
+            stop_ev.set()
+            pty_session.remove_listener(q)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         pathname = parsed.path
         qs = parse_qs(parsed.query)
 
         try:
+            if pathname == "/api/pty":
+                return self.handle_pty_ws(qs)
+
+            if pathname == "/api/pty/stream":
+                cols = int(qs.get("cols", ["80"])[0] or 80)
+                rows = int(qs.get("rows", ["24"])[0] or 24)
+                pty_session.ensure_started(cols, rows)
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_cors_headers()
+                self.end_headers()
+
+                q, hist = pty_session.add_listener()
+                try:
+                    if hist:
+                        b64 = base64.b64encode(hist).decode("ascii")
+                        self.wfile.write(f"data: {json.dumps({'b64': b64})}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    while True:
+                        try:
+                            chunk = q.get(timeout=15)
+                            b64 = base64.b64encode(chunk).decode("ascii")
+                            self.wfile.write(f"data: {json.dumps({'b64': b64})}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                        except queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    pty_session.remove_listener(q)
+                return
+
             if pathname == "/":
                 index_path = os.path.join(BASE_DIR, "index.html")
                 if os.path.exists(index_path):
@@ -375,7 +795,6 @@ class PanelHandler(BaseHTTPRequestHandler):
                         modified = ""
                         try:
                             st = entry.stat()
-                            # আসল মডিফিকেশন টাইমস্ট্যাম্প আনা হচ্ছে
                             modified = datetime.fromtimestamp(st.st_mtime).strftime("%m/%d/%y")
                             if is_dir:
                                 count = len(os.listdir(entry.path))
@@ -442,7 +861,6 @@ class PanelHandler(BaseHTTPRequestHandler):
                         shutil.copyfileobj(f, self.wfile)
                     return
 
-                # Folder download as zip
                 tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
                 tmp.close()
                 try:
@@ -472,6 +890,24 @@ class PanelHandler(BaseHTTPRequestHandler):
 
         try:
             data = self.read_json()
+
+            if pathname == "/api/pty/input":
+                pty_session.write(data.get("data", "").encode("utf-8"))
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/pty/resize":
+                pty_session.resize(data.get("cols", 80), data.get("rows", 24))
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/setstart":
+                cmd = (data.get("cmd") or "").strip()
+                if not cmd:
+                    return self.send_json(400, {"error": "Command required"})
+                start_cmd = cmd
+                with open(START_FILE, "w", encoding="utf-8") as f:
+                    f.write(start_cmd)
+                broadcast("ok", f"Startup command updated: {start_cmd}")
+                return self.send_json(200, {"ok": True, "cmd": start_cmd})
 
             if pathname == "/api/file":
                 target = safe_join(data.get("path", ""))
