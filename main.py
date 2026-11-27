@@ -10,6 +10,7 @@ import queue
 import base64
 import shutil
 import signal
+import socket
 import struct
 import hashlib
 import termios
@@ -55,6 +56,7 @@ export TERM="xterm-256color"
 export COLORTERM="truecolor"
 export LANG="C.UTF-8"
 export LC_ALL="C.UTF-8"
+export WORKSPACE="{WORKSPACE}"
 export PATH="$HOME/.local/bin:{WORKSPACE}/.local/bin:./node_modules/.bin:$PATH"
 export HISTFILE="{HIST_FILE}"
 export HISTSIZE=5000
@@ -67,7 +69,27 @@ alias ll='ls -alF --color=auto'
 alias la='ls -A --color=auto'
 alias grep='grep --color=auto'
 
-PS1='\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\[\\e[1;32m\\]\\$\\[\\e[0m\\] '
+cd() {{
+  if [ $# -eq 0 ]; then
+    builtin cd "$WORKSPACE"
+  elif [ "$1" = "$HOME" ]; then
+    builtin cd "$WORKSPACE"
+  elif [ "${{1#"$HOME/"}}" != "$1" ] && [ -e "$WORKSPACE/${{1#"$HOME/"}}" ]; then
+    builtin cd "$WORKSPACE/${{1#"$HOME/"}}"
+  else
+    builtin cd "$@"
+  fi
+}}
+
+__panel_cwd() {{
+  case "$PWD" in
+    "$WORKSPACE") printf "~" ;;
+    "$WORKSPACE"/*) printf "~/%s" "${{PWD#$WORKSPACE/}}" ;;
+    *) printf "%s" "$PWD" ;;
+  esac
+}}
+
+PS1='\\[\\e[1;34m\\]$(__panel_cwd)\\[\\e[0m\\]\\[\\e[1;32m\\]\\$\\[\\e[0m\\] '
 
 _panel_api() {{
   "{sys.executable}" -c '
@@ -118,7 +140,7 @@ class PtySession:
         self.cols = 80
         self.rows = 24
         self.history = bytearray()
-        self.max_history = 65536
+        self.max_history = 24576
         self.listeners = set()
         self.listeners_lock = threading.Lock()
         self.reader_started = False
@@ -147,6 +169,7 @@ class PtySession:
         env["COLORTERM"] = "truecolor"
         env["LANG"] = "C.UTF-8"
         env["LC_ALL"] = "C.UTF-8"
+        env["WORKSPACE"] = WORKSPACE
         env["PATH"] = f"{os.path.expanduser('~')}/.local/bin:{WORKSPACE}/.local/bin:{env.get('PATH', '')}"
 
         bash_path = shutil.which("bash")
@@ -261,7 +284,6 @@ class PtySession:
             except OSError:
                 pass
 
-            # Shell exited or fd closed; clean up and respawn
             with self.lock:
                 if self.master_fd == fd:
                     try:
@@ -624,6 +646,10 @@ class PanelHandler(BaseHTTPRequestHandler):
 
         sock = self.connection
         sock.settimeout(None)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         send_lock = threading.Lock()
         stop_ev = threading.Event()
         q, hist = pty_session.add_listener()
@@ -645,27 +671,25 @@ class PanelHandler(BaseHTTPRequestHandler):
         wt.start()
 
         frag_buf = bytearray()
-        frag_opcode = None
         try:
             while not stop_ev.is_set():
                 opcode, payload, fin = ws_recv_frame(self.rfile)
                 if opcode is None:
                     break
-                if opcode == 0x8:  # Close
+                if opcode == 0x8:
                     try:
                         ws_send(sock, send_lock, 0x8, b"")
                     except Exception:
                         pass
                     break
-                if opcode == 0x9:  # Ping
+                if opcode == 0x9:
                     ws_send(sock, send_lock, 0xA, payload)
                     continue
-                if opcode == 0xA:  # Pong
+                if opcode == 0xA:
                     continue
 
                 if opcode in (0x1, 0x2):
                     if not fin:
-                        frag_opcode = opcode
                         frag_buf = bytearray(payload)
                         continue
                     msg_bytes = payload
@@ -675,7 +699,6 @@ class PanelHandler(BaseHTTPRequestHandler):
                         continue
                     msg_bytes = bytes(frag_buf)
                     frag_buf.clear()
-                    frag_opcode = None
                 else:
                     continue
 
@@ -762,10 +785,6 @@ class PanelHandler(BaseHTTPRequestHandler):
                 q = queue.Queue()
                 with sse_lock:
                     sse_clients.add(q)
-
-                init_msg = json.dumps({"type": "sys", "text": f'Connected. Startup cmd: "{start_cmd}"'})
-                self.wfile.write(f"data: {init_msg}\n\n".encode("utf-8"))
-                self.wfile.flush()
 
                 try:
                     while True:
