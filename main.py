@@ -147,11 +147,17 @@ class PtySession:
 
     def ensure_started(self, cols=None, rows=None):
         with self.lock:
+            size_changed = False
             if cols and rows:
-                self.cols = max(10, min(500, int(cols)))
-                self.rows = max(4, min(200, int(rows)))
+                new_cols = max(10, min(500, int(cols)))
+                new_rows = max(4, min(200, int(rows)))
+                if new_cols != self.cols or new_rows != self.rows:
+                    self.cols = new_cols
+                    self.rows = new_rows
+                    size_changed = True
             if self.proc is not None and self.proc.poll() is None and self.master_fd is not None:
-                self._apply_winsize_locked()
+                if size_changed:
+                    self._apply_winsize_locked()
                 return
             self._spawn_locked()
 
@@ -217,13 +223,18 @@ class PtySession:
 
     def resize(self, cols, rows):
         with self.lock:
-            self.cols = max(10, min(500, int(cols)))
-            self.rows = max(4, min(200, int(rows)))
+            new_cols = max(10, min(500, int(cols)))
+            new_rows = max(4, min(200, int(rows)))
+            if new_cols == self.cols and new_rows == self.rows:
+                return
+            self.cols = new_cols
+            self.rows = new_rows
             self._apply_winsize_locked()
 
     def write(self, data_bytes):
-        self.ensure_started()
         with self.lock:
+            if self.proc is None or self.proc.poll() is not None or self.master_fd is None:
+                self._spawn_locked()
             fd = self.master_fd
         if fd is None:
             return
@@ -277,7 +288,7 @@ class PtySession:
                 time.sleep(0.05)
                 continue
             try:
-                data = os.read(fd, 4096)
+                data = os.read(fd, 16384)
                 if data:
                     self._push_output(data)
                     continue
@@ -661,6 +672,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                 while not stop_ev.is_set():
                     try:
                         chunk = q.get(timeout=20)
+                        if not q.empty():
+                            buf = bytearray(chunk)
+                            while len(buf) < 65536:
+                                try:
+                                    buf.extend(q.get_nowait())
+                                except queue.Empty:
+                                    break
+                            chunk = bytes(buf)
                         ws_send(sock, send_lock, 0x2, chunk)
                     except queue.Empty:
                         ws_send(sock, send_lock, 0x9, b"ping")
@@ -747,6 +766,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                     while True:
                         try:
                             chunk = q.get(timeout=15)
+                            if not q.empty():
+                                buf = bytearray(chunk)
+                                while len(buf) < 65536:
+                                    try:
+                                        buf.extend(q.get_nowait())
+                                    except queue.Empty:
+                                        break
+                                chunk = bytes(buf)
                             b64 = base64.b64encode(chunk).decode("ascii")
                             self.wfile.write(f"data: {json.dumps({'b64': b64})}\n\n".encode("utf-8"))
                             self.wfile.flush()
@@ -816,7 +843,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                             st = entry.stat()
                             modified = datetime.fromtimestamp(st.st_mtime).strftime("%m/%d/%y")
                             if is_dir:
-                                count = len(os.listdir(entry.path))
+                                with os.scandir(entry.path) as sub_it:
+                                    count = sum(1 for _ in sub_it)
                             else:
                                 size = st.st_size
                         except Exception:
@@ -1132,6 +1160,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 class PanelServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
 
 
 if __name__ == "__main__":
