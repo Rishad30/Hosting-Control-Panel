@@ -30,6 +30,7 @@ WORKSPACE = os.path.join(BASE_DIR, "workspace")
 START_FILE = os.path.join(BASE_DIR, ".startcmd")
 REQ_HASH_FILE = os.path.join(BASE_DIR, ".req_hash")
 RC_FILE = os.path.join(BASE_DIR, ".panel_bashrc")
+INPUTRC_FILE = os.path.join(BASE_DIR, ".panel_inputrc")
 HIST_FILE = os.path.join(BASE_DIR, ".panel_bash_history")
 
 os.makedirs(WORKSPACE, exist_ok=True)
@@ -48,7 +49,34 @@ sse_clients = set()
 sse_lock = threading.Lock()
 
 
+def write_panel_inputrc():
+    inputrc_content = """set input-meta on
+set output-meta on
+set convert-meta off
+set completion-ignore-case on
+set show-all-if-ambiguous on
+set colored-stats on
+set colored-completion-prefix on
+set mark-symlinked-directories on
+set bell-style none
+
+"\\e[A": previous-history
+"\\e[B": next-history
+"\\e[5~": history-search-backward
+"\\e[6~": history-search-forward
+"\\e[1;5C": forward-word
+"\\e[1;5D": backward-word
+"\\e[H": beginning-of-line
+"\\e[F": end-of-line
+"\\e[3~": delete-char
+"""
+    with open(INPUTRC_FILE, "w", encoding="utf-8") as f:
+        f.write(inputrc_content)
+
+
 def write_panel_bashrc():
+    write_panel_inputrc()
+    editor = "nano" if shutil.which("nano") else ("vim" if shutil.which("vim") else "vi")
     rc_content = f"""[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc 2>/dev/null || true
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
 
@@ -57,17 +85,27 @@ export COLORTERM="truecolor"
 export LANG="C.UTF-8"
 export LC_ALL="C.UTF-8"
 export WORKSPACE="{WORKSPACE}"
+export INPUTRC="{INPUTRC_FILE}"
+export EDITOR="{editor}"
+export VISUAL="{editor}"
+export PAGER="less"
+export LESS="-R"
+export CLICOLOR=1
 export PATH="$HOME/.local/bin:{WORKSPACE}/.local/bin:./node_modules/.bin:$PATH"
 export HISTFILE="{HIST_FILE}"
 export HISTSIZE=5000
 export HISTFILESIZE=10000
+export HISTCONTROL=ignoreboth:erasedups
 shopt -s histappend 2>/dev/null || true
 shopt -s checkwinsize 2>/dev/null || true
+shopt -s cdspell 2>/dev/null || true
 
 alias ls='ls --color=auto'
 alias ll='ls -alF --color=auto'
 alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
 alias grep='grep --color=auto'
+alias cls='clear'
 
 cd() {{
   if [ $# -eq 0 ]; then
@@ -89,7 +127,7 @@ __panel_cwd() {{
   esac
 }}
 
-PS1='\\[\\e[1;34m\\]$(__panel_cwd)\\[\\e[0m\\]\\[\\e[1;32m\\]\\$\\[\\e[0m\\] '
+PS1='\\[\\e[1;34m\\]$(__panel_cwd)\\[\\e[0m\\]\\[\\e[1;32m\\] \\$\\[\\e[0m\\] '
 
 _panel_api() {{
   "{sys.executable}" -c '
@@ -170,12 +208,22 @@ class PtySession:
             struct.pack("HHHH", self.rows, self.cols, 0, 0),
         )
 
+        # Enable UTF-8 erase support on the PTY
+        try:
+            attrs = termios.tcgetattr(slave_fd)
+            if hasattr(termios, "IUTF8"):
+                attrs[0] |= termios.IUTF8
+            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass
+
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["LANG"] = "C.UTF-8"
         env["LC_ALL"] = "C.UTF-8"
         env["WORKSPACE"] = WORKSPACE
+        env["INPUTRC"] = INPUTRC_FILE
         env["PATH"] = f"{os.path.expanduser('~')}/.local/bin:{WORKSPACE}/.local/bin:{env.get('PATH', '')}"
 
         bash_path = shutil.which("bash")
@@ -205,6 +253,30 @@ class PtySession:
         if not self.reader_started:
             self.reader_started = True
             threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def restart(self):
+        with self.lock:
+            old_proc = self.proc
+            old_fd = self.master_fd
+            self.master_fd = None
+            self.proc = None
+            self.history.clear()
+        if old_proc is not None and old_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(old_proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    old_proc.kill()
+                except Exception:
+                    pass
+        if old_fd is not None:
+            try:
+                os.close(old_fd)
+            except Exception:
+                pass
+        with self.lock:
+            self._push_output_unlocked(b"\x1b[2J\x1b[H\x1b[32m[Shell restarted]\x1b[0m\r\n")
+            self._spawn_locked()
 
     def _apply_winsize_locked(self):
         if self.master_fd is None:
@@ -261,11 +333,10 @@ class PtySession:
         with self.listeners_lock:
             self.listeners.discard(q)
 
-    def _push_output(self, chunk):
-        with self.lock:
-            self.history.extend(chunk)
-            if len(self.history) > self.max_history:
-                del self.history[: len(self.history) - self.max_history]
+    def _push_output_unlocked(self, chunk):
+        self.history.extend(chunk)
+        if len(self.history) > self.max_history:
+            del self.history[: len(self.history) - self.max_history]
         with self.listeners_lock:
             for q in list(self.listeners):
                 try:
@@ -278,6 +349,10 @@ class PtySession:
                         pass
                 except Exception:
                     pass
+
+    def _push_output(self, chunk):
+        with self.lock:
+            self._push_output_unlocked(chunk)
 
     def _read_loop(self):
         while True:
@@ -302,13 +377,13 @@ class PtySession:
                     except Exception:
                         pass
                     self.master_fd = None
-                if proc is not None and proc.poll() is None:
-                    try:
-                        proc.wait(timeout=0.5)
-                    except Exception:
-                        pass
-                self._push_output(b"\r\n\x1b[33m[Shell exited, restarting...]\x1b[0m\r\n")
-                self._spawn_locked()
+                    if proc is not None and proc.poll() is None:
+                        try:
+                            proc.wait(timeout=0.5)
+                        except Exception:
+                            pass
+                    self._push_output_unlocked(b"\r\n\x1b[33m[Shell exited, restarting...]\x1b[0m\r\n")
+                    self._spawn_locked()
 
 
 pty_session = PtySession()
@@ -653,6 +728,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
         cols = int(qs.get("cols", ["80"])[0] or 80)
         rows = int(qs.get("rows", ["24"])[0] or 24)
+        replay = qs.get("replay", ["1"])[0] != "0"
         pty_session.ensure_started(cols, rows)
 
         sock = self.connection
@@ -667,7 +743,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
         def writer_loop():
             try:
-                if hist:
+                if replay and hist:
                     ws_send(sock, send_lock, 0x2, hist)
                 while not stop_ev.is_set():
                     try:
@@ -728,6 +804,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                         pty_session.write(msg.get("d", "").encode("utf-8"))
                     elif t == "r":
                         pty_session.resize(msg.get("c", 80), msg.get("r", 24))
+                    elif t == "p":
+                        ws_send(sock, send_lock, 0xA, b"pong")
                 except Exception:
                     pty_session.write(msg_bytes)
         except Exception:
@@ -748,6 +826,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             if pathname == "/api/pty/stream":
                 cols = int(qs.get("cols", ["80"])[0] or 80)
                 rows = int(qs.get("rows", ["24"])[0] or 24)
+                replay = qs.get("replay", ["1"])[0] != "0"
                 pty_session.ensure_started(cols, rows)
 
                 self.send_response(200)
@@ -759,7 +838,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
                 q, hist = pty_session.add_listener()
                 try:
-                    if hist:
+                    if replay and hist:
                         b64 = base64.b64encode(hist).decode("ascii")
                         self.wfile.write(f"data: {json.dumps({'b64': b64})}\n\n".encode("utf-8"))
                         self.wfile.flush()
@@ -944,6 +1023,10 @@ class PanelHandler(BaseHTTPRequestHandler):
 
             if pathname == "/api/pty/resize":
                 pty_session.resize(data.get("cols", 80), data.get("rows", 24))
+                return self.send_json(200, {"ok": True})
+
+            if pathname == "/api/pty/restart":
+                pty_session.restart()
                 return self.send_json(200, {"ok": True})
 
             if pathname == "/api/setstart":
